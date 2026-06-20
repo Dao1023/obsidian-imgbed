@@ -1,5 +1,8 @@
 name: Deploy Dashboard to Pages
 
+# 部署 obsidian-imgbed 的 dashboard.html + 演示样本 db 到 GitHub Pages。
+# 触发：main 分支 push 改动到 dashboard / 样本 db / 本 workflow，
+# 或在 Actions 页面手动 workflow_dispatch。
 on:
   push:
     branches: [main]
