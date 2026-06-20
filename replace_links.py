@@ -1,9 +1,9 @@
 """
-将 Obsidian Markdown 中的图片 wikilink 替换为图床直链。
+将 Obsidian Markdown 中的图片 wikilink 替换为图床直链 —— obsidian-imgbed
 
 输入：
   - manifest DB（图片上传记录，filename → oss_key）
-  - C:\\Obsidian\\Markdown 下所有 .md
+  - Markdown 根目录（递归扫描所有 .md）
 
 规则：
   [[xxx.png]]      → ![](<url>)
@@ -12,11 +12,17 @@
   ![](local/path)  → ![](<url>)   (本地相对路径也尝试 basename 匹配)
 
 非图片扩展名 / DB 未命中 → 原样保留。
+
+用法：
+    uv run replace_links.py --md-dir /path/to/md --db manifest.db \\
+        --url-prefix https://bucket.oss-cn-shanghai.aliyuncs.com/ --dry-run
+    # 确认无误后加 --apply 才写盘
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -24,17 +30,18 @@ from collections import Counter
 from pathlib import Path, PurePath
 from urllib.parse import quote
 
-# ============ 配置 ============
-DB_PATH = Path(__file__).resolve().parent / "oss_upload_manifest.db"
-SRC_MD_DIR = Path(r"C:\Obsidian\Markdown")
-URL_PREFIX = "https://img-dao.oss-cn-shanghai.aliyuncs.com/"
+# 可选：自动加载 .env
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except ImportError:
+    pass
 
 # 这些扩展名才视为“图片”，参与替换
 IMG_EXTS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
     ".svg", ".ico", ".tiff", ".tif", ".avif", ".heic",
 }
-# =============================
 
 
 def load_db(db_path: Path) -> dict[str, str]:
@@ -44,14 +51,17 @@ def load_db(db_path: Path) -> dict[str, str]:
         "SELECT filename, oss_key FROM files WHERE status='done'"
     ).fetchall()
     conn.close()
-    # 小写做 key，大小写不敏感匹配
     return {name.lower(): key for name, key in rows}
 
 
-def build_url(oss_key: str) -> str:
-    # quote 保留 /，整体用 <> 包裹，安全处理中文/特殊字符/空格/括号
-    encoded = quote(oss_key, safe="/")
-    return f"<{URL_PREFIX}{encoded}>"
+def make_url_builder(url_prefix: str):
+    """返回一个把 oss_key 转成最终 markdown URL 的函数。"""
+    # 确保 prefix 以 / 结尾
+    prefix = url_prefix if url_prefix.endswith("/") else url_prefix + "/"
+    def build_url(oss_key: str) -> str:
+        encoded = quote(oss_key, safe="/")
+        return f"<{prefix}{encoded}>"
+    return build_url
 
 
 # wikilink: [[...]] 可选前缀 !，内部可带 |opts
@@ -67,16 +77,16 @@ def is_image_name(name: str) -> bool:
 def replace_text(
     text: str,
     db: dict[str, str],
+    build_url,
     stats: Counter,
     miss_buf: list[str],
     src_file: str,
 ) -> str:
     def wiki_sub(m: re.Match) -> str:
         target = m.group(2).strip()
-        # 取 basename（Obsidian 允许 [[path/to/x.png]]）
         base = PurePath(target).name
         if not is_image_name(base):
-            return m.group(0)  # 非图片，原样
+            return m.group(0)
         key = db.get(base.lower())
         if key is None:
             stats["miss"] += 1
@@ -87,7 +97,6 @@ def replace_text(
 
     def md_img_sub(m: re.Match) -> str:
         alt, path = m.group(1), m.group(2).strip()
-        # 仅处理本地路径（http 开头的不动）
         if path.startswith(("http://", "https://", "<")):
             return m.group(0)
         base = PurePath(path).name
@@ -107,50 +116,67 @@ def replace_text(
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="将 Obsidian Markdown 中的图片 wikilink 替换为图床直链（obsidian-imgbed）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--md-dir", default=os.environ.get("OBSIDIAN_MD_DIR"),
+                    help="Obsidian Markdown 根目录（递归扫描）")
+    ap.add_argument("--db", default=os.environ.get("OSS_MANIFEST_DB", "manifest.db"),
+                    help="SQLite 清单路径")
+    ap.add_argument("--url-prefix", default=os.environ.get("OSS_URL_PREFIX"),
+                    help="图床公开 URL 前缀，例如 https://bucket.oss-cn-shanghai.aliyuncs.com/")
     ap.add_argument("--apply", action="store_true",
                     help="默认 dry-run，加此参数才真正写文件")
-    ap.add_argument("--miss-log", type=Path,
-                    default=Path(__file__).resolve().parent / "oss_replace_miss.txt",
-                    help="未命中图片引用列表输出位置")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="显式指定 dry-run（默认即此模式）")
+    ap.add_argument("--miss-log", type=Path, default=None,
+                    help="未命中图片引用列表输出位置（默认与 db 同目录的 *_replace_miss.txt）")
     args = ap.parse_args()
 
-    if not SRC_MD_DIR.exists():
-        print(f"[fatal] 源目录不存在: {SRC_MD_DIR}", file=sys.stderr)
-        sys.exit(1)
+    if not args.md_dir:
+        ap.error("--md-dir 必填（或设置 OBSIDIAN_MD_DIR）")
+    if not args.url_prefix:
+        ap.error("--url-prefix 必填（或设置 OSS_URL_PREFIX）")
 
-    db = load_db(DB_PATH)
+    src_md_dir = Path(args.md_dir)
+    if not src_md_dir.is_dir():
+        ap.error(f"md-dir 不是目录: {src_md_dir}")
+
+    db_path = Path(args.db)
+    miss_log = args.miss_log or db_path.with_name(db_path.stem + "_replace_miss.txt")
+
+    db = load_db(db_path)
     print(f"[load] DB 命中图片记录: {len(db)}")
 
-    md_files = list(SRC_MD_DIR.rglob("*.md"))
-    # 排除 .obsidian 等隐藏目录
+    md_files = list(src_md_dir.rglob("*.md"))
     md_files = [
         p for p in md_files
-        if not any(part.startswith(".") for part in p.relative_to(SRC_MD_DIR).parts)
+        if not any(part.startswith(".") for part in p.relative_to(src_md_dir).parts)
     ]
     print(f"[scan] Markdown 文件: {len(md_files)}")
 
+    build_url = make_url_builder(args.url_prefix)
     stats: Counter = Counter()
     miss_buf: list[str] = []
-    changed_files = 0
 
     for p in md_files:
         try:
             orig = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             orig = p.read_text(encoding="utf-8", errors="replace")
-        new = replace_text(orig, db, stats, miss_buf, str(p.relative_to(SRC_MD_DIR)))
+        new = replace_text(orig, db, build_url, stats, miss_buf, str(p.relative_to(src_md_dir)))
         if new != orig:
-            changed_files += 1
             if args.apply:
                 stats["changed_files"] += 1
                 p.write_text(new, encoding="utf-8")
             else:
                 stats["would_change_files"] += 1
 
-    args.miss_log.write_text(
-        "\n".join(miss_buf), encoding="utf-8"
-    ) if miss_buf else args.miss_log.unlink(missing_ok=True)
+    if miss_buf:
+        miss_log.write_text("\n".join(miss_buf), encoding="utf-8")
+    else:
+        miss_log.unlink(missing_ok=True)
 
     print()
     print("========== 统计 ==========")
@@ -160,11 +186,11 @@ def main():
     print(f"wikilink 替换次数   : {stats['replaced_wikilink']}")
     print(f"markdown 链接替换   : {stats['replaced_mdlink']}")
     print(f"未命中（保留原样） : {stats['miss']}")
-    print(f"未命中列表          : {args.miss_log if miss_buf else '（无）'}")
+    print(f"未命中列表          : {miss_log if miss_buf else '（无）'}")
 
     if not args.apply:
         print()
-        print("确认无误后运行: python replace_links.py --apply")
+        print(f"确认无误后运行: uv run replace_links.py --md-dir ... --db ... --url-prefix ... --apply")
 
 
 if __name__ == "__main__":

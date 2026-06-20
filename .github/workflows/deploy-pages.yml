@@ -1,0 +1,51 @@
+name: Deploy Dashboard to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - dashboard.html
+      - examples/sample_manifest.db
+      - .github/workflows/deploy-pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只允许一次部署
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build site
+        run: |
+          mkdir -p site
+          cp dashboard.html site/index.html
+          if [ -f examples/sample_manifest.db ]; then
+            cp examples/sample_manifest.db site/
+          fi
+          # 可选：把 README 也带一份方便访客查看
+          cp README.md site/ 2>/dev/null || true
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

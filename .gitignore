@@ -10,6 +10,8 @@ oss.md
 *.sqlite
 *.sqlite3
 *.csv
+# 例外：演示用样本数据库需要进 git
+!examples/sample_manifest.db
 
 # === 运行产物 ===
 .oss_store/

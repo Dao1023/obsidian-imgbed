@@ -55,6 +55,12 @@
 
   <!-- Dashboard -->
   <div id="dashboard" class="hidden">
+    <div id="demoBanner" class="alert alert-info py-2 px-4 mb-3 hidden">
+      <div class="flex-1 text-sm">
+        🎁 当前加载的是<strong>演示数据</strong>（sample_manifest.db，20 条假图）。
+        点击「重新加载」可拖入你自己的 <code>manifest.db</code> 查看真实数据。
+      </div>
+    </div>
     <div role="tablist" class="tabs tabs-boxed bg-base-100 shadow mb-4">
       <button role="tab" class="tab tab-lg tab-btn tab-active" data-tab="overview">📊 总览</button>
       <button role="tab" class="tab tab-lg tab-btn" data-tab="search">🔍 搜索</button>
@@ -80,7 +86,11 @@
 </dialog>
 
 <script>
-const OSS_PREFIX = "https://img-dao.oss-cn-shanghai.aliyuncs.com/";
+// 图床 URL 前缀（用于拼装缩略图 / 原图链接）。
+// 把下面这行改成你自己的 bucket URL 即可，例如：
+//   https://your-bucket.oss-cn-shanghai.aliyuncs.com/
+// 演示模式下用 examples/ 里的 sample db，缩略图会 404 属正常现象（无真实 OSS 资源）。
+const OSS_PREFIX = "https://your-bucket.oss-cn-shanghai.aliyuncs.com/";
 let DB = null, SQL = null;
 let previewEnabled = false;
 
@@ -405,10 +415,10 @@ const dragZone = document.getElementById('dragZone');
 }));
 dropzone.addEventListener('drop', e => {
   const f = e.dataTransfer.files[0];
-  if (f) loadDb(f);
+  if (f) { document.getElementById('demoBanner').classList.add('hidden'); loadDb(f); }
 });
 document.getElementById('fileInput').addEventListener('change', e => {
-  if (e.target.files[0]) loadDb(e.target.files[0]);
+  if (e.target.files[0]) { document.getElementById('demoBanner').classList.add('hidden'); loadDb(e.target.files[0]); }
 });
 document.getElementById('reloadBtn').addEventListener('click', () => {
   DB = null;
@@ -419,6 +429,7 @@ document.getElementById('reloadBtn').addEventListener('click', () => {
   pb.classList.remove('btn-solid', 'btn-warning');
   document.getElementById('dbBadge').classList.add('hidden');
   document.getElementById('reloadBtn').classList.add('hidden');
+  document.getElementById('demoBanner').classList.add('hidden');
   pb.classList.add('hidden');
   document.getElementById('dashboard').classList.add('hidden');
   document.getElementById('dropzone').classList.remove('hidden');
@@ -459,6 +470,34 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 document.getElementById('themeToggle').addEventListener('change', e => {
   document.documentElement.setAttribute('data-theme', e.target.checked ? 'light' : 'dark');
 });
+
+// ========== 启动时尝试自动加载演示数据 ==========
+// 仅在 http(s) 环境下生效（本地 file:// 打开则跳过，保留拖拽区）
+(async function tryAutoLoadDemo() {
+  if (!/^https?:/.test(location.protocol)) return;
+  // 兼容两种部署：Pages 根目录 / 本地 examples/
+  const candidates = ['sample_manifest.db', 'examples/sample_manifest.db'];
+  let buf = null;
+  for (const path of candidates) {
+    try {
+      const res = await fetch(path, { cache: 'no-store' });
+      if (!res.ok) continue;
+      const b = await res.arrayBuffer();
+      if (b && b.byteLength > 0) { buf = b; break; }
+    } catch (e) { /* try next */ }
+  }
+  if (!buf) return;
+  try {
+    await loadDb({
+      name: 'sample_manifest.db (演示)',
+      size: buf.byteLength,
+      arrayBuffer: () => Promise.resolve(buf),
+    });
+    document.getElementById('demoBanner').classList.remove('hidden');
+  } catch (e) {
+    // 加载失败回退到拖拽区
+  }
+})();
 </script>
 </body>
 </html>

@@ -1,8 +1,26 @@
 [project]
-name = "1-oss"
+name = "obsidian-imgbed"
 version = "0.1.0"
-requires-python = ">=3.13"
+description = "Obsidian 图片 → 阿里云 OSS 迁移 + wikilink 替换 + 反向引用可视化 dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Dao1023" }]
+keywords = ["obsidian", "aliyun", "oss", "imgbed", "image-hosting", "markdown", "wikilink"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
 dependencies = [
     "oss2>=2.19.1",
     "tqdm>=4.68.3",
+    "python-dotenv>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Dao1023/obsidian-imgbed"
+Repository = "https://github.com/Dao1023/obsidian-imgbed"
+Issues = "https://github.com/Dao1023/obsidian-imgbed/issues"

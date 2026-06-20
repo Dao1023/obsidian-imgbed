@@ -1,29 +1,39 @@
 """
-扫描所有 .md，统计每张图片被哪些笔记引用。
+扫描所有 .md，统计每张图片被哪些笔记引用 —— obsidian-imgbed
 
 数据源：
   - 仍残留的 wikilink：[[xxx.png]] / ![[xxx.png]]
-  - 已被替换的图床直链：![](<https://img-dao.oss-cn-shanghai.aliyuncs.com/xxx>)
+  - 已被替换的图床直链：![](<https://bucket...aliyuncs.com/xxx>)
+  - 极少见的本地 md 图片链接（未替换的）
 
 输出：
   1. SQLite 关系表 refs(image_filename, md_path) — 规范化、可任意 JOIN
-  2. 视图 ref_summary(filename, size, ref_count, referenced_by)
+  2. 视图 ref_summary(filename, size, oss_key, ref_count, referenced_by)
   3. CSV：filename, size, ref_count, md_files（| 分隔）
+
+用法：
+    uv run build_refs.py --md-dir /path/to/md --db manifest.db \\
+        --url-prefix https://bucket.oss-cn-shanghai.aliyuncs.com/ \\
+        --csv-out refs.csv
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import os
 import re
 import sqlite3
 import sys
 from pathlib import Path, PurePath
 from urllib.parse import unquote
 
-DB_PATH = Path(__file__).resolve().parent / "oss_upload_manifest.db"
-SRC_MD_DIR = Path(r"C:\Obsidian\Markdown")
-URL_PREFIX = "https://img-dao.oss-cn-shanghai.aliyuncs.com/"
-CSV_OUT = Path(__file__).resolve().parent / "image_refs.csv"
+# 可选：自动加载 .env
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except ImportError:
+    pass
 
 IMG_EXTS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
@@ -37,7 +47,34 @@ MD_IMG_LOCAL_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 
 
 def main():
-    conn = sqlite3.connect(DB_PATH)
+    ap = argparse.ArgumentParser(
+        description="扫描 Markdown 笔记，构建图片反向引用表（obsidian-imgbed）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--md-dir", default=os.environ.get("OBSIDIAN_MD_DIR"),
+                    help="Obsidian Markdown 根目录（递归扫描）")
+    ap.add_argument("--db", default=os.environ.get("OSS_MANIFEST_DB", "manifest.db"),
+                    help="SQLite 清单路径（写入 refs 表与 ref_summary 视图）")
+    ap.add_argument("--url-prefix", default=os.environ.get("OSS_URL_PREFIX"),
+                    help="图床公开 URL 前缀（用于识别已被替换的图床直链）")
+    ap.add_argument("--csv-out", default=None,
+                    help="CSV 输出路径（默认与 db 同目录的 *_refs.csv）")
+    args = ap.parse_args()
+
+    if not args.md_dir:
+        ap.error("--md-dir 必填（或设置 OBSIDIAN_MD_DIR）")
+    if not args.url_prefix:
+        ap.error("--url-prefix 必填（或设置 OSS_URL_PREFIX）")
+
+    src_md_dir = Path(args.md_dir)
+    if not src_md_dir.is_dir():
+        ap.error(f"md-dir 不是目录: {src_md_dir}")
+
+    db_path = Path(args.db)
+    csv_out = Path(args.csv_out) if args.csv_out else db_path.with_name(db_path.stem + "_refs.csv")
+    url_prefix = args.url_prefix if args.url_prefix.endswith("/") else args.url_prefix + "/"
+
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
 
     # oss_key → filename 的反查表（含大小写不敏感）
@@ -61,9 +98,9 @@ def main():
     )
 
     md_files = [
-        p for p in SRC_MD_DIR.rglob("*.md")
+        p for p in src_md_dir.rglob("*.md")
         if not any(part.startswith(".")
-                   for part in p.relative_to(SRC_MD_DIR).parts)
+                   for part in p.relative_to(src_md_dir).parts)
     ]
     print(f"[scan] Markdown: {len(md_files)}")
 
@@ -72,7 +109,7 @@ def main():
     files_with_ref = 0
 
     for p in md_files:
-        rel = p.relative_to(SRC_MD_DIR).as_posix()
+        rel = p.relative_to(src_md_dir).as_posix()
         try:
             text = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -91,9 +128,9 @@ def main():
         # 2) 已替换的图床 URL
         for m in MD_IMG_RE.finditer(text):
             url = m.group(1)
-            if not url.startswith(URL_PREFIX):
+            if not url.startswith(url_prefix):
                 continue
-            oss_key = unquote(url[len(URL_PREFIX):])
+            oss_key = unquote(url[len(url_prefix):])
             name = key_to_name.get(oss_key.lower())
             if name:
                 hits.add(name)
@@ -147,7 +184,7 @@ def main():
         ORDER BY ref_count DESC, filename
         """
     ).fetchall()
-    with CSV_OUT.open("w", encoding="utf-8-sig", newline="") as f:
+    with csv_out.open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["filename", "size", "ref_count", "md_files"])
         for r in rows:
@@ -181,10 +218,10 @@ def main():
     for name, n in top5:
         print(f"  {n:>4}  {name}")
     print()
-    print(f"CSV 已导出: {CSV_OUT}")
+    print(f"CSV 已导出: {csv_out}")
     print()
     print("查询示例:")
-    print("  sqlite3 oss_upload_manifest.db \\")
+    print(f"  sqlite3 {db_path.name} \\")
     print('    "SELECT md_path FROM refs WHERE image_filename=\'xxx.png\'"')
 
 

@@ -1,9 +1,11 @@
 // 用 sql.js 直接跑一遍 dashboard.html 里的所有 SQL，验证语法 + schema
+// 用法：bun run test_queries.mjs [path/to/manifest.db]
 import initSqlJs from "sql.js";
 import { readFileSync } from "node:fs";
 
 const SQL = await initSqlJs();
-const buf = readFileSync("oss_upload_manifest_snapshot.db");
+const dbPath = process.argv[2] || "examples/sample_manifest.db";
+const buf = readFileSync(dbPath);
 const db = new SQL.Database(new Uint8Array(buf));
 
 function q(sql, params = []) {
