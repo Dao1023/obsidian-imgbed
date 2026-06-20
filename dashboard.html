@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSS 图床 Dashboard</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" type="text/css">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .scroll-area { max-height: 65vh; overflow-y: auto; }
+  .thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; background: #8882; }
+  .thumb:hover { transform: scale(1.5); transition: transform .15s; }
+  .tab-active { font-weight: 700 !important; color: var(--p) !important; border-color: var(--p) !important; }
+</style>
+</head>
+<body class="min-h-screen bg-base-200">
+
+<!-- Navbar -->
+<div class="navbar bg-base-100 shadow sticky top-0 z-20">
+  <div class="flex-1 px-4 gap-3 items-center">
+    <span class="text-xl">📦</span>
+    <span class="font-bold text-lg">OSS 图床 Dashboard</span>
+    <span id="dbBadge" class="badge badge-neutral hidden"></span>
+  </div>
+  <div class="flex-none gap-2 px-4 items-center">
+    <button id="previewBtn" class="btn btn-sm btn-warning btn-outline hidden" title="加载缩略图会请求 OSS，消耗流量">🖼️ 打开预览</button>
+    <button id="reloadBtn" class="btn btn-sm btn-ghost hidden">重新加载</button>
+    <label class="swap swap-rotate btn btn-sm btn-ghost">
+      <input type="checkbox" id="themeToggle">
+      <div class="swap-on">🌙</div>
+      <div class="swap-off">☀️</div>
+    </label>
+  </div>
+</div>
+
+<main class="container mx-auto p-4 max-w-7xl">
+
+  <!-- Dropzone -->
+  <div id="dropzone" class="mt-8">
+    <div class="card bg-base-100 shadow-xl">
+      <div id="dragZone" class="card-body items-center text-center py-20 border-2 border-dashed border-base-300 m-4 rounded-box transition-colors">
+        <div class="text-6xl mb-4">🗂️</div>
+        <h2 class="text-2xl font-bold">拖入 <code class="bg-base-200 px-2 py-1 rounded">oss_upload_manifest.db</code></h2>
+        <p class="opacity-60 py-3">或</p>
+        <input type="file" id="fileInput" accept=".db,.sqlite,.sqlite3" class="file-input file-input-bordered w-full max-w-xs">
+        <p class="opacity-50 text-sm mt-6 leading-relaxed">
+          数据库在浏览器本地解析，<strong>不会上传到任何服务器</strong><br>
+          sql.js (SQLite WASM) + sql.js HTTP from CDN · 首次加载需联网下载 WASM (~1MB)
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <div id="dashboard" class="hidden">
+    <div role="tablist" class="tabs tabs-boxed bg-base-100 shadow mb-4">
+      <button role="tab" class="tab tab-lg tab-btn tab-active" data-tab="overview">📊 总览</button>
+      <button role="tab" class="tab tab-lg tab-btn" data-tab="search">🔍 搜索</button>
+      <button role="tab" class="tab tab-lg tab-btn" data-tab="tops">🏆 Top 榜</button>
+      <button role="tab" class="tab tab-lg tab-btn" data-tab="orphans">🗑️ 孤儿图</button>
+    </div>
+    <div id="panel-overview" class="panel"></div>
+    <div id="panel-search" class="panel hidden"></div>
+    <div id="panel-tops" class="panel hidden"></div>
+    <div id="panel-orphans" class="panel hidden"></div>
+  </div>
+</main>
+
+<!-- Modal -->
+<dialog id="imgModal" class="modal">
+  <div class="modal-box w-11/12 max-w-3xl">
+    <div id="imgModalContent"></div>
+    <div class="modal-action">
+      <form method="dialog"><button class="btn">关闭</button></form>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+const OSS_PREFIX = "https://img-dao.oss-cn-shanghai.aliyuncs.com/";
+let DB = null, SQL = null;
+let previewEnabled = false;
+
+async function ensureSqlJs() {
+  if (!SQL) SQL = await initSqlJs({ locateFile: f => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${f}` });
+  return SQL;
+}
+
+async function loadDb(file) {
+  try {
+    await ensureSqlJs();
+    const buf = await file.arrayBuffer();
+    DB = new SQL.Database(new Uint8Array(buf));
+    // 探针：确保表存在
+    const tables = query("SELECT name FROM sqlite_master WHERE type='table'").map(r => r.name);
+    if (!tables.includes('files')) throw new Error('DB 缺少 files 表');
+    document.getElementById('dbBadge').textContent = `${file.name} · ${(file.size/1024/1024).toFixed(2)} MB`;
+    document.getElementById('dbBadge').classList.remove('hidden');
+    document.getElementById('reloadBtn').classList.remove('hidden');
+    document.getElementById('previewBtn').classList.remove('hidden');
+    document.getElementById('dropzone').classList.add('hidden');
+    document.getElementById('dashboard').classList.remove('hidden');
+    renderAll();
+  } catch (e) {
+    alert('加载失败：' + e.message);
+  }
+}
+
+function query(sql, params=[]) {
+  const stmt = DB.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+function queryOne(sql, params=[]) { return query(sql, params)[0] || null; }
+
+function fmtSize(b) {
+  if (b == null) return '';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(2) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+function ossUrl(key) { return OSS_PREFIX + encodeURI(key || ''); }
+function thumb(key) {
+  if (!previewEnabled) return '<div class="thumb flex items-center justify-center text-xs opacity-40">🚫预览</div>';
+  return `<img class="thumb" src="${ossUrl(key)}" loading="lazy" onerror="this.style.opacity=0.15">`;
+}
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ========== Render ==========
+function renderAll() {
+  renderOverview();
+  renderSearch('');
+  renderTops();
+  renderOrphans();
+}
+
+function renderOverview() {
+  const t = queryOne("SELECT COUNT(*) c, COALESCE(SUM(size),0) s FROM files");
+  const refImgs = queryOne("SELECT COUNT(DISTINCT image_filename) c FROM refs").c;
+  const mdCount = queryOne("SELECT COUNT(DISTINCT md_path) c FROM refs").c;
+  const refTotal = queryOne("SELECT COUNT(*) c FROM refs").c;
+  const orphan = t.c - refImgs;
+  const orphanSize = queryOne(`SELECT COALESCE(SUM(size),0) s FROM files f
+    WHERE NOT EXISTS (SELECT 1 FROM refs r WHERE r.image_filename=f.filename)`).s;
+
+  document.getElementById('panel-overview').innerHTML = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="stat bg-base-100 rounded-box shadow py-4">
+        <div class="stat-title">图片总数</div>
+        <div class="stat-value text-primary">${t.c.toLocaleString()}</div>
+        <div class="stat-desc">${fmtSize(t.s)}</div>
+      </div>
+      <div class="stat bg-base-100 rounded-box shadow py-4">
+        <div class="stat-title">被引用</div>
+        <div class="stat-value text-success">${refImgs.toLocaleString()}</div>
+        <div class="stat-desc">${(refImgs*100/t.c).toFixed(1)}%</div>
+      </div>
+      <div class="stat bg-base-100 rounded-box shadow py-4">
+        <div class="stat-title">孤儿图</div>
+        <div class="stat-value text-warning">${orphan.toLocaleString()}</div>
+        <div class="stat-desc">${fmtSize(orphanSize)} · ${(orphan*100/t.c).toFixed(1)}%</div>
+      </div>
+      <div class="stat bg-base-100 rounded-box shadow py-4">
+        <div class="stat-title">引用过的 md</div>
+        <div class="stat-value text-info">${mdCount.toLocaleString()}</div>
+        <div class="stat-desc">总引用 ${refTotal.toLocaleString()} 次</div>
+      </div>
+    </div>
+
+    <div class="card bg-base-100 shadow mt-4">
+      <div class="card-body">
+        <h3 class="card-title text-base">📈 引用量分布（被引用的图片）</h3>
+        <div id="distChart" class="flex gap-2 h-24 items-end mt-2"></div>
+        <div class="flex justify-between text-xs opacity-60 mt-1">
+          <span>1 次</span><span>2 次</span><span>3-5 次</span><span>6-10 次</span><span>11+ 次</span>
+        </div>
+        <p class="text-xs opacity-50 mt-2">⚠️ 注意：被同一 md 多次引用会重复计数</p>
+      </div>
+    </div>
+  `;
+
+  const buckets = query(`
+    SELECT CASE WHEN rc=1 THEN 0 WHEN rc=2 THEN 1 WHEN rc<=5 THEN 2 WHEN rc<=10 THEN 3 ELSE 4 END b, COUNT(*) c
+    FROM (SELECT filename, ref_count rc FROM ref_summary WHERE ref_count > 0) GROUP BY b ORDER BY b
+  `);
+  const byBucket = {0:0,1:0,2:0,3:0,4:0};
+  buckets.forEach(r => byBucket[r.b] = r.c);
+  const max = Math.max(...Object.values(byBucket), 1);
+  const colors = ['bg-primary','bg-success','bg-info','bg-warning','bg-error'];
+  document.getElementById('distChart').innerHTML = Object.entries(byBucket).map(([b,c],i) =>
+    `<div class="${colors[i]} rounded-t flex items-end justify-center text-xs pb-1"
+          style="height:${Math.max(c*100/max,4)}%;flex:1" title="${c} 张">${c>0?c:''}</div>`
+  ).join('');
+}
+
+function renderSearch(q) {
+  const panel = document.getElementById('panel-search');
+  panel.innerHTML = `
+    <div class="flex gap-2 mb-3">
+      <input type="text" id="searchInput" placeholder="按文件名搜索（模糊匹配）..."
+             class="input input-bordered flex-1" value="${esc(q)}">
+      <button id="clearBtn" class="btn btn-ghost">清除</button>
+    </div>
+    <div id="searchMeta" class="text-sm opacity-60 mb-2"></div>
+    <div class="overflow-x-auto scroll-area bg-base-100 rounded-box shadow">
+      <table class="table table-sm">
+        <thead><tr><th>缩略</th><th>文件名</th><th>大小</th><th>引用</th><th>操作</th></tr></thead>
+        <tbody id="searchBody"></tbody>
+      </table>
+    </div>
+  `;
+  document.getElementById('searchInput').addEventListener('input', e => renderSearchResults(e.target.value));
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    document.getElementById('searchInput').value = '';
+    renderSearchResults('');
+  });
+  renderSearchResults(q);
+}
+
+let lastSearchRows = [];
+function renderSearchResults(q) {
+  q = (q || '').trim();
+  let rows, meta;
+  if (!q) {
+    rows = query(`SELECT f.filename, f.size, f.oss_key,
+      (SELECT COUNT(*) FROM refs r WHERE r.image_filename=f.filename) ref_count
+      FROM files f ORDER BY ref_count DESC, f.size DESC LIMIT 100`);
+    meta = `默认显示前 100 张（按引用量降序）`;
+  } else {
+    rows = query(`SELECT f.filename, f.size, f.oss_key,
+      (SELECT COUNT(*) FROM refs r WHERE r.image_filename=f.filename) ref_count
+      FROM files f WHERE f.filename LIKE ? COLLATE NOCASE
+      ORDER BY ref_count DESC, f.size DESC LIMIT 500`, ['%'+q+'%']);
+    meta = `找到 ${rows.length} 条` + (rows.length >= 500 ? '（仅前 500）' : '');
+  }
+  lastSearchRows = rows;
+  document.getElementById('searchMeta').textContent = meta;
+  const body = document.getElementById('searchBody');
+  if (rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="5" class="text-center opacity-50 py-8">无结果</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((r, idx) => `<tr class="hover">
+      <td>${thumb(r.oss_key)}</td>
+      <td class="break-all max-w-md text-sm">${esc(r.filename)}</td>
+      <td class="whitespace-nowrap">${fmtSize(r.size)}</td>
+      <td><span class="badge badge-sm ${r.ref_count>0?'badge-success':'badge-ghost'}">${r.ref_count}</span></td>
+      <td class="whitespace-nowrap">
+        <button class="btn btn-xs detail-btn" data-idx="${idx}">详情</button>
+        <a class="btn btn-xs btn-ghost" target="_blank" href="${ossUrl(r.oss_key)}">原图</a>
+      </td>
+    </tr>`).join('');
+}
+
+function renderTops() {
+  const topRef = query(`SELECT filename, oss_key, ref_count FROM ref_summary
+    ORDER BY ref_count DESC, filename LIMIT 15`);
+  const topSize = query(`SELECT filename, oss_key, size FROM files ORDER BY size DESC LIMIT 15`);
+  document.getElementById('panel-tops').innerHTML = `
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card bg-base-100 shadow">
+        <div class="card-body">
+          <h3 class="card-title text-base">🏆 引用量 Top 15</h3>
+          <div class="overflow-x-auto">
+            <table class="table table-sm">
+              <thead><tr><th>#</th><th>缩略</th><th>文件名</th><th>引用</th></tr></thead>
+              <tbody>
+                ${topRef.map((r,i) => `<tr class="hover">
+                  <td>${i+1}</td>
+                  <td>${thumb(r.oss_key)}</td>
+                  <td class="break-all max-w-[200px] text-xs">${esc(r.filename)}</td>
+                  <td><span class="badge badge-primary badge-sm">${r.ref_count}</span></td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card bg-base-100 shadow">
+        <div class="card-body">
+          <h3 class="card-title text-base">💾 大小 Top 15</h3>
+          <div class="overflow-x-auto">
+            <table class="table table-sm">
+              <thead><tr><th>#</th><th>缩略</th><th>文件名</th><th>大小</th></tr></thead>
+              <tbody>
+                ${topSize.map((r,i) => `<tr class="hover">
+                  <td>${i+1}</td>
+                  <td>${thumb(r.oss_key)}</td>
+                  <td class="break-all max-w-[200px] text-xs">${esc(r.filename)}</td>
+                  <td class="whitespace-nowrap">${fmtSize(r.size)}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderOrphans() {
+  const rows = query(`SELECT f.filename, f.size, f.oss_key FROM files f
+    WHERE NOT EXISTS (SELECT 1 FROM refs r WHERE r.image_filename=f.filename)
+    ORDER BY f.size DESC`);
+  const totalSize = rows.reduce((a,r) => a+r.size, 0);
+  document.getElementById('panel-orphans').innerHTML = `
+    <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+      <div>
+        <h3 class="text-lg font-bold">🗑️ 孤儿图（未被任何 md 引用）</h3>
+        <p class="text-sm opacity-60">${rows.length} 张，共 ${fmtSize(totalSize)}</p>
+      </div>
+      <button class="btn btn-sm btn-primary" onclick="exportOrphanCsv()">⬇ 导出 CSV</button>
+    </div>
+    <div class="overflow-x-auto scroll-area bg-base-100 rounded-box shadow">
+      <table class="table table-sm">
+        <thead><tr><th>缩略</th><th>文件名</th><th>大小</th><th>原图</th></tr></thead>
+        <tbody>
+          ${rows.slice(0,500).map(r => `<tr class="hover">
+            <td>${thumb(r.oss_key)}</td>
+            <td class="break-all max-w-md text-sm">${esc(r.filename)}</td>
+            <td class="whitespace-nowrap">${fmtSize(r.size)}</td>
+            <td><a class="btn btn-xs btn-ghost" target="_blank" href="${ossUrl(r.oss_key)}">↗</a></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    ${rows.length > 500 ? '<p class="text-center opacity-50 text-sm mt-2">仅显示前 500 条，完整列表请用 CSV 导出</p>' : ''}
+  `;
+}
+
+function exportOrphanCsv() {
+  const rows = query(`SELECT f.filename, f.size, f.oss_key FROM files f
+    WHERE NOT EXISTS (SELECT 1 FROM refs r WHERE r.image_filename=f.filename) ORDER BY f.size DESC`);
+  const csv = '\ufeff' + ['filename,size,oss_url']
+    .concat(rows.map(r => `"${r.filename.replace(/"/g,'""')}",${r.size},${ossUrl(r.oss_key)}`))
+    .join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'orphan_images.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+window.showDetail = function(r) {
+  const refs = query(`SELECT md_path FROM refs WHERE image_filename=? ORDER BY md_path`, [r.filename]);
+  document.getElementById('imgModalContent').innerHTML = `
+    <div class="grid md:grid-cols-2 gap-4">
+      <div>
+        <img src="${ossUrl(r.oss_key)}" class="w-full rounded shadow bg-base-300" onerror="this.classList.add('hidden');this.nextElementSibling.classList.remove('hidden')">
+        <div class="hidden alert alert-error mt-2">图片加载失败（可能 OSS 权限未开放或网络问题）</div>
+        <a class="btn btn-sm btn-block mt-2" target="_blank" href="${ossUrl(r.oss_key)}">🔗 查看原图</a>
+      </div>
+      <div>
+        <h3 class="font-bold text-base break-all">${esc(r.filename)}</h3>
+        <div class="py-2 space-y-1 text-sm">
+          <div class="flex gap-2"><span class="opacity-60 w-16">大小</span>${fmtSize(r.size)}</div>
+          <div class="flex gap-2"><span class="opacity-60 w-16">引用</span><span class="badge badge-primary badge-sm">${r.ref_count}</span></div>
+          <div class="flex gap-2"><span class="opacity-60 w-16">OSS Key</span><code class="text-xs break-all">${esc(r.oss_key)}</code></div>
+        </div>
+        <div class="divider my-2"></div>
+        <h4 class="font-bold text-sm mb-2">📄 引用此图的笔记 (${refs.length})：</h4>
+        ${refs.length === 0 ? '<p class="opacity-50 text-sm">未被任何 md 引用（孤儿图）</p>' :
+          `<ul class="menu bg-base-200 rounded-box max-h-60 overflow-y-auto text-sm">
+            ${refs.map(rf => `<li><a onclick="copyText(this)" data-path="${esc(rf.md_path)}" title="点击复制路径">${esc(rf.md_path)}</a></li>`).join('')}
+          </ul>`}
+      </div>
+    </div>
+  `;
+  document.getElementById('imgModal').showModal();
+};
+
+window.copyText = async function(el) {
+  const text = el.getAttribute('data-path');
+  try {
+    await navigator.clipboard.writeText(text);
+    const t = document.createElement('div');
+    t.className = 'toast toast-end z-50';
+    t.innerHTML = `<div class="alert alert-success py-2"><span>已复制</span></div>`;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 1200);
+  } catch (e) { console.warn(e); }
+};
+
+// ========== Events ==========
+const dropzone = document.getElementById('dropzone');
+const dragZone = document.getElementById('dragZone');
+['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault();
+  dragZone.classList.add('border-primary');
+}));
+['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+  e.preventDefault();
+  dragZone.classList.remove('border-primary');
+}));
+dropzone.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0];
+  if (f) loadDb(f);
+});
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) loadDb(e.target.files[0]);
+});
+document.getElementById('reloadBtn').addEventListener('click', () => {
+  DB = null;
+  previewEnabled = false;
+  const pb = document.getElementById('previewBtn');
+  pb.textContent = '🖼️ 打开预览';
+  pb.classList.add('btn-outline');
+  pb.classList.remove('btn-solid', 'btn-warning');
+  document.getElementById('dbBadge').classList.add('hidden');
+  document.getElementById('reloadBtn').classList.add('hidden');
+  pb.classList.add('hidden');
+  document.getElementById('dashboard').classList.add('hidden');
+  document.getElementById('dropzone').classList.remove('hidden');
+  document.getElementById('fileInput').value = '';
+});
+
+document.getElementById('previewBtn').addEventListener('click', () => {
+  const pb = document.getElementById('previewBtn');
+  if (!previewEnabled) {
+    if (!confirm('⚠️ 打开预览将从 OSS 加载所有缩略图，会消耗网络流量（约 12800 张图）。\n\n确认继续？')) return;
+    previewEnabled = true;
+    pb.textContent = '🚫 关闭预览';
+    pb.classList.remove('btn-outline');
+  } else {
+    previewEnabled = false;
+    pb.textContent = '🖼️ 打开预览';
+    pb.classList.add('btn-outline');
+  }
+  renderAll();
+});
+
+document.getElementById('panel-search').addEventListener('click', e => {
+  const btn = e.target.closest('.detail-btn');
+  if (!btn) return;
+  const idx = Number(btn.dataset.idx);
+  if (lastSearchRows[idx]) showDetail(lastSearchRows[idx]);
+});
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('tab-active'));
+    btn.classList.add('tab-active');
+    document.querySelectorAll('.panel').forEach(p => p.classList.add('hidden'));
+    document.getElementById('panel-' + btn.dataset.tab).classList.remove('hidden');
+  });
+});
+
+document.getElementById('themeToggle').addEventListener('change', e => {
+  document.documentElement.setAttribute('data-theme', e.target.checked ? 'light' : 'dark');
+});
+</script>
+</body>
+</html>

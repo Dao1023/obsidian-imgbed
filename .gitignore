@@ -1,0 +1,41 @@
+# === 凭证 / 机密（绝不提交）===
+.env
+oss.md
+*.env
+
+# === 数据库 / 导出（含真实文件名与笔记路径）===
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.csv
+
+# === 运行产物 ===
+.oss_store/
+oss_replace_miss.txt
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# === Bun / Node ===
+node_modules/
+bun-cache/
+
+# === 截图与临时调试产物 ===
+shot-*.png
+*.local.png
+
+# === 系统 ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === 编辑器 ===
+.vscode/
+.idea/
+*.swp
